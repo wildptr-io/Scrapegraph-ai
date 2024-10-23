@@ -2,7 +2,8 @@
 GenerateAnswerNode Module
 """
 from typing import List, Optional
-from langchain.prompts import PromptTemplate
+from langchain_core.messages import SystemMessage
+from langchain.prompts import PromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.runnables import RunnableParallel
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
@@ -115,46 +116,53 @@ class GenerateAnswerNode(BaseNode):
             template_merge_prompt = self.additional_info + template_merge_prompt
 
         if len(doc) == 1:
-            prompt = PromptTemplate(
-                template=template_no_chunks_prompt,
-                input_variables=["question"],
-                partial_variables={"context": doc, "format_instructions": format_instructions}
+            system_msg = SystemMessage(content=template_no_chunks_prompt.format(format_instructions=format_instructions, question=user_prompt))
+            chat_template = ChatPromptTemplate.from_messages(
+                [
+                    system_msg,
+                    HumanMessagePromptTemplate.from_template("The following is the website content:\n{web_content}"),
+                ]
             )
-            chain = prompt | self.llm_model
+
+            chain = chat_template | self.llm_model
             if output_parser:
                 chain = chain | output_parser
-            answer =  chain.invoke({"question": user_prompt})
+            answer =  chain.invoke({"web_content" : doc[0]})
 
             state.update({self.output[0]: answer})
             return state
 
         chains_dict = {}
+        system_msg = SystemMessage(content=template_chunks_prompt.format(format_instructions=format_instructions, question=user_prompt))
+        batch_input = []
         for i, chunk in enumerate(tqdm(doc, desc="Processing chunks", disable=not self.verbose)):
-            prompt = PromptTemplate(
-                template=template_chunks_prompt,
-                input_variables=["question"],
-                partial_variables={"context": chunk,
-                                   "chunk_id": i + 1,
-                                   "format_instructions": format_instructions}
+            chat_template = ChatPromptTemplate.from_messages(
+                [
+                    system_msg,
+                    HumanMessagePromptTemplate.from_template("Content of {chunk_id}:\n{context}"),
+                ]
             )
+            batch_input.append({"chunk_id":i + 1, "context":chunk})
             chain_name = f"chunk{i+1}"
-            chains_dict[chain_name] = prompt | self.llm_model
+            chains_dict[chain_name] = chat_template | self.llm_model
             if output_parser:
                 chains_dict[chain_name] = chains_dict[chain_name] | output_parser
-
+        
         async_runner = RunnableParallel(**chains_dict)
-        batch_results =  async_runner.invoke({"question": user_prompt})
+        batch_results =  async_runner.batch(inputs=batch_input)
 
-        merge_prompt = PromptTemplate(
-            template=template_merge_prompt,
-            input_variables=["context", "question"],
-            partial_variables={"format_instructions": format_instructions}
-        )
+        system_msg = SystemMessage(content=template_merge_prompt.format(format_instructions=format_instructions, question=user_prompt))
+        merge_prompt = ChatPromptTemplate.from_messages(
+                [
+                    system_msg,
+                    HumanMessagePromptTemplate.from_template("Here are all the chunks:\n{context}"),
+                ]
+            )
 
         merge_chain = merge_prompt | self.llm_model
         if output_parser:
             merge_chain = merge_chain | output_parser
-        answer =  merge_chain.invoke({"context": batch_results, "question": user_prompt})
+        answer =  merge_chain.invoke({"context": batch_results})
 
         state.update({self.output[0]: answer})
         return state
